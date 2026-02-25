@@ -9,131 +9,136 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 
+// Render usa PORT dinámico
+const PORT = process.env.PORT || 8787;
+
+// OpenAI (IA)
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ====== JSON Schema estricto para salida (nada de texto) ======
-const COST_SCHEMA = {
-  name: "cost_plan",
-  schema: {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      assumptions: { type: "array", items: { type: "string" } },
-      professionals: {
-        type: "array",
-        items: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            cargo: { type: "string" },
-            perfil: { type: "string" },
-            cantidad: { type: "number" },
-            meses: { type: "number" },
-            dedicacionPct: { type: "number" },
-            valorMensual: { type: "number" },
-            fuente: { type: "string" },
-            confianza: { type: "number" }
-          },
-          required: ["cargo","perfil","cantidad","meses","dedicacionPct","valorMensual","fuente","confianza"]
-        }
-      },
-      materials: {
-        type: "array",
-        items: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            descripcion: { type: "string" },
-            tipo: { type: "string" },
-            cantidad: { type: "number" },
-            meses: { type: "number" },
-            unitPrice: { type: "number" },
-            unit: { type: "string" },
-            fuentePrecio: { type: "string" },
-            confianza: { type: "number" }
-          },
-          required: ["descripcion","tipo","cantidad","meses","unitPrice","unit","fuentePrecio","confianza"]
-        }
-      }
-    },
-    required: ["assumptions","professionals","materials"]
-  }
-};
+// =====================
+// 1) Salud del servidor
+// =====================
+app.get("/health", (req, res) => {
+  res.json({ ok: true, service: "aitec-costos-backend" });
+});
 
-// ===== Health check =====
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-// ===== IA: genera plan =====
-app.post("/ai", async (req, res) => {
+// ============================================
+// 2) Búsqueda de materiales (MercadoLibre CO)
+// ============================================
+// Nota: esto es para "buscar en línea" sin API key.
+// No es perfecto, pero funciona como MVP real.
+app.get("/materials/search", async (req, res) => {
   try {
-    const {
-      methodologyText = "",
-      tdrText = "",
-      projectData = {},
-      salaryTable = []
-    } = req.body || {};
+    const q = (req.query.q || "").toString().trim();
+    if (!q) return res.status(400).json({ error: "Falta parámetro q" });
 
-    const developer = `
-Eres un analista de costos de producción para licitaciones.
+    // MercadoLibre Colombia
+    const url = `https://api.mercadolibre.com/sites/MCO/search?q=${encodeURIComponent(
+      q
+    )}&limit=12`;
 
-REGLAS DURAS:
-1) Salarios: SOLO puedes asignar valorMensual si lo puedes justificar con salaryTable. Si no, usa 0 y agrega el supuesto en assumptions.
-2) Materiales: NO inventes precios. Si no hay fuente explícita, unitPrice=0, unit="unidad" y fuentePrecio="PENDIENTE COTIZACIÓN".
-3) Devuelve SOLO JSON válido según el esquema. Nada de texto adicional.
-4) Equipo realista (sin sobrecargar).
-5) DedicacionPct entre 10 y 100.
-6) Meses coherente con projectData.plazoMeses si existe.
-`;
+    const r = await fetch(url);
+    if (!r.ok) {
+      return res.status(500).json({ error: "Error consultando MercadoLibre" });
+    }
+    const data = await r.json();
 
-    const input = {
-      methodologyText,
-      tdrText,
-      projectData,
-      salaryTable
-    };
+    const items =
+      (data.results || []).map((it) => ({
+        id: it.id,
+        title: it.title,
+        price: it.price,
+        currency: it.currency_id,
+        thumbnail: it.thumbnail,
+        permalink: it.permalink,
+        seller: it.seller?.nickname || null,
+        condition: it.condition || null,
+      })) || [];
 
-    const resp = await client.responses.create({
-      model: "gpt-5",
-      input: [
-        { role: "developer", content: developer },
-        { role: "user", content: JSON.stringify(input) }
-      ],
-      response_format: { type: "json_schema", json_schema: COST_SCHEMA }
-    });
-
-    const text = resp.output_text;
-    const data = JSON.parse(text);
-    return res.json({ ok: true, data });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: err?.message || "Error en /ai" });
+    res.json({ query: q, items });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Fallo en /materials/search" });
   }
 });
 
-// ===== Precios unitarios (modo conservador) =====
-app.post("/price", async (req, res) => {
+// ===============================================
+// 3) IA: Generar propuesta de profesionales/materiales
+// ===============================================
+// Entrada: metodología (texto), TDR (texto), notas (texto), contexto (objeto contrato)
+// Salida: JSON con sugerencias de profesionales/materiales
+app.post("/ai/plan", async (req, res) => {
   try {
-    const { query = "", unitHint = "unidad" } = req.body || {};
-    const q = String(query).trim();
-    if (!q) {
-      return res.json({ ok: true, data: { unitPrice: 0, currency: "COP", unit: unitHint, source: "PENDIENTE", confidence: 0 } });
+    const { contractObject, methodologyText, tdrText, notes } = req.body || {};
+
+    if (!tdrText || !methodologyText) {
+      return res.status(400).json({
+        error:
+          "Faltan campos. Debes enviar methodologyText y tdrText (texto).",
+      });
     }
 
-    // MODO CONSERVADOR (no inventa):
-    // Cuando decidas proveedor (MercadoLibre/Homecenter/etc.), aquí se integra real.
-    return res.json({
-      ok: true,
-      data: {
-        unitPrice: 0,
-        currency: "COP",
-        unit: unitHint,
-        source: "PENDIENTE COTIZACIÓN (integrar proveedor)",
-        confidence: 0
-      }
+    const system = `
+Eres un asistente de costos de producción para licitaciones en Colombia.
+Debes proponer:
+1) Lista de profesionales (roles) con cantidad, meses, dedicación (%), factor prestacional sugerido (default 1.58) y un estimado de valor mensual (COP).
+2) Lista de materiales (items) con cantidad, meses, valor mensual/unitario estimado (COP) y justificación corta.
+Reglas:
+- Responder SOLO JSON.
+- Nada de texto adicional.
+- Si algún valor no está claro, asume y agrega "assumptions".
+- La dedicación en profesionales debe ser realista y rara vez 100%.
+- Materiales: separar software/hardware/logística/viáticos/papelería.
+- Valores: si no hay datos, estimar rangos razonables y dejar marcado como "estimated".
+Formato:
+{
+  "assumptions": ["..."],
+  "professionals": [
+    {"role":"...", "qty":1, "months":6, "dedication":0.5, "factor":1.58, "monthly_cop": 8000000, "notes":"estimated|source|justification"}
+  ],
+  "materials": [
+    {"item":"...", "category":"software|hardware|logistica|viaticos|papeleria|otros", "qty":1, "months":1, "monthly_or_unit_cop": 1200000, "pricing_type":"monthly|unit", "notes":"estimated|source|justification"}
+  ]
+}
+`.trim();
+
+    const user = `
+OBJETO DEL CONTRATO:
+${contractObject || "(no especificado)"}
+
+METODOLOGÍA:
+${methodologyText}
+
+TÉRMINOS DE REFERENCIA (TDR):
+${tdrText}
+
+NOTAS DEL USUARIO (perfiles/alcance/condiciones):
+${notes || "(sin notas)"}
+`.trim();
+
+    const completion = await client.chat.completions.create({
+      model: "gpt-4.1-mini",
+      temperature: 0.2,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      response_format: { type: "json_object" },
     });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: err?.message || "Error en /price" });
+
+    const content = completion.choices?.[0]?.message?.content || "{}";
+    const json = JSON.parse(content);
+
+    res.json(json);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({
+      error:
+        "Fallo en /ai/plan. Revisa logs. Asegura OPENAI_API_KEY en Render.",
+    });
   }
 });
 
-const port = process.env.PORT || 8787;
-app.listen(port, () => console.log(`Server listo en puerto ${port}`));
+app.listen(PORT, () => {
+  console.log("Servidor escuchando en puerto:", PORT);
+});
