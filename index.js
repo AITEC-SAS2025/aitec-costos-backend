@@ -1,358 +1,549 @@
+// index.js (ESM) - Backend Costos AITEC (Render)
+// Requiere: express, cors, dotenv, openai
+// package.json debe tener: "type": "module"
+
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
-import multer from "multer";
-import pdfParse from "pdf-parse";
-import XLSX from "xlsx";
 
 dotenv.config();
 
 const app = express();
+
+// -------------------- Config --------------------
 app.use(cors());
-app.use(express.json({ limit: "2mb" })); // importante: NO aceptar base64 enormes en JSON
+app.use(express.json({ limit: "25mb" })); // ajusta si vas a enviar textos largos (NO base64 gigantes)
 
-// Multer: subidas en memoria
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 12 * 1024 * 1024 } // 12MB
-});
-
+// Render usa PORT dinámico
 const PORT = process.env.PORT || 10000;
+
+// Si no está, la IA quedará deshabilitada (el resto funciona)
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const openaiConfigured = Boolean(OPENAI_API_KEY && OPENAI_API_KEY.trim().length > 10);
 
-let client = null;
-if (OPENAI_API_KEY) client = new OpenAI({ apiKey: OPENAI_API_KEY });
+const client = openaiConfigured ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
-// ====== Almacenamiento simple en memoria (MVP) ======
-// OJO: en Render Free esto se borra si reinicia. Para producción: BD (Postgres, etc.)
-const DB = {
-  professionals: [], // cargados desde excel
-  costings: [] // guardados
-};
+// Límite de entrada para IA (evita que te manden PDFs en base64 sin querer)
+const MAX_IA_INPUT_CHARS = 120_000; // ~120k caracteres (bastante texto). Base64 PDF suele ser MUCHO más.
+const MAX_CATALOG_ITEMS = 5000;
+
+// -------------------- In-memory DB (simple) --------------------
+// Si quieres persistencia real: usar DB (Postgres/SQLite) o KV. Por ahora: memoria.
+let MATERIALS = [];      // { id, name, unit, unitPrice, source, tags[] }
+let PROFESSIONALS = [];  // { id, role, profile, monthlyRef, unit:"mes", source, tags[] }
+let COSTINGS = [];       // { id, createdAt, updatedAt, title, objectText, params, professionals, materials, totals, notes, trace }
+
+function uid(prefix = "id") {
+  return `${prefix}_${Math.random().toString(16).slice(2)}_${Date.now().toString(16)}`;
+}
 
 function nowISO() {
   return new Date().toISOString();
 }
 
-function safeNumber(x, fallback = 0) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : fallback;
+function normalizeStr(s) {
+  return (s || "").toString().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 }
 
-function chunkText(text, maxChars = 9000) {
-  const chunks = [];
-  let i = 0;
-  while (i < text.length) {
-    chunks.push(text.slice(i, i + maxChars));
-    i += maxChars;
+function clampNumber(n, min, max, fallback = 0) {
+  const x = Number(n);
+  if (Number.isNaN(x)) return fallback;
+  return Math.min(max, Math.max(min, x));
+}
+
+function money(n) {
+  const x = Number(n);
+  if (Number.isNaN(x)) return 0;
+  return Math.round(x);
+}
+
+function computeTotals({ professionals = [], materials = [], params = {} }) {
+  const factorPrestacional = clampNumber(params.factorPrestacional ?? 1.58, 1.0, 3.0, 1.58);
+  const imprevistosPct = clampNumber(params.imprevistosPct ?? 5, 0, 40, 5);
+  const margenPct = clampNumber(params.margenPct ?? 30, 0, 80, 30);
+
+  const subtotalProfesionales = professionals.reduce((acc, p) => {
+    const qty = clampNumber(p.quantity ?? 0, 0, 1e9, 0);
+    const months = clampNumber(p.months ?? 0, 0, 1e9, 0);
+    const dedication = clampNumber(p.dedication ?? 1, 0, 2, 1); // 1=100%
+    const monthly = clampNumber(p.monthlyValue ?? 0, 0, 1e12, 0);
+
+    // costo base mensual * factor prestacional
+    const base = qty * months * dedication * monthly * factorPrestacional;
+    return acc + base;
+  }, 0);
+
+  const subtotalMateriales = materials.reduce((acc, m) => {
+    const qty = clampNumber(m.quantity ?? 0, 0, 1e12, 0);
+    const unitPrice = clampNumber(m.unitPrice ?? 0, 0, 1e12, 0);
+    return acc + qty * unitPrice;
+  }, 0);
+
+  const subtotalProduccion = subtotalProfesionales + subtotalMateriales;
+  const imprevistos = subtotalProduccion * (imprevistosPct / 100);
+  const totalProduccion = subtotalProduccion + imprevistos;
+
+  // Oferta sugerida: costo / (1 - margen)
+  const ofertaSugerida = margenPct >= 100 ? null : (totalProduccion / (1 - (margenPct / 100)));
+
+  const presupuestoFijo = params.presupuestoFijo != null && params.presupuestoFijo !== ""
+    ? clampNumber(params.presupuestoFijo, 0, 1e15, 0)
+    : null;
+
+  // Si hay presupuesto fijo, se puede estimar margen posible:
+  let margenPosible = null;
+  if (presupuestoFijo && presupuestoFijo > 0) {
+    margenPosible = (presupuestoFijo - totalProduccion) / presupuestoFijo * 100;
   }
-  return chunks;
+
+  return {
+    factorPrestacional,
+    imprevistosPct,
+    margenPct,
+    presupuestoFijo,
+    subtotalProfesionales: money(subtotalProfesionales),
+    subtotalMateriales: money(subtotalMateriales),
+    subtotalProduccion: money(subtotalProduccion),
+    imprevistos: money(imprevistos),
+    totalProduccion: money(totalProduccion),
+    ofertaSugerida: ofertaSugerida == null ? null : money(ofertaSugerida),
+    margenPosible: margenPosible == null ? null : Math.round(margenPosible * 100) / 100
+  };
 }
 
-// Si llega texto con data:application/pdf;base64..., lo bloqueamos (esa era la causa del desastre)
-function rejectBase64PDF(text) {
-  if (!text) return false;
-  const t = String(text);
-  return t.includes("data:application/pdf;base64");
-}
+// -------------------- Routes --------------------
 
-// Root
+// Root: evita "Cannot GET /"
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
     message: "API de Costos AITEC funcionando correctamente 🚀",
     docs: {
       health: "/health",
-      aiCosteo: "POST /ai/costeo (multipart: metodologia_pdf, tdr_pdf, + fields)",
-      professionalsLoad: "POST /professionals/load (multipart: excel)",
-      professionalsSearch: "GET /professionals/search?q=...",
+      materialsLoad: "POST /materials/load",
+      materialsSearch: "GET /materials/search?q=...&top=8",
+      professionalsLoad: "POST /professionals/load",
+      professionalsSearch: "GET /professionals/search?q=...&top=8",
+      aiCosteo: "POST /ai/costeo",
       costingsSave: "POST /costings/save",
       costingsList: "GET /costings/list",
       costingsGet: "GET /costings/:id",
       costingsUpdate: "PUT /costings/:id",
       costingsDelete: "DELETE /costings/:id"
     },
-    openaiConfigured: Boolean(OPENAI_API_KEY)
+    openaiConfigured
   });
 });
 
-app.get("/health", (req, res) => res.json({ ok: true, ts: nowISO() }));
-
-// ====== Profesionales (Excel) ======
-app.post("/professionals/load", upload.single("excel"), (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "Falta archivo excel" });
-
-    const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
-    const sheetName = workbook.SheetNames[0];
-    const sheet = workbook.Sheets[sheetName];
-    const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
-
-    // MVP: intenta mapear columnas comunes (ajusta si tus headers son distintos)
-    DB.professionals = rows.map((r, idx) => {
-      const perfil = r["Perfil"] || r["perfil"] || r["Cargo"] || r["cargo"] || r["Rol"] || r["rol"] || "";
-      const valor = r["Valor mensual"] || r["valor mensual"] || r["Salario"] || r["salario"] || r["Tarifa"] || r["tarifa"] || "";
-      const seniority = r["Experiencia"] || r["experiencia"] || r["Años"] || r["años"] || "";
-
-      return {
-        id: String(idx + 1),
-        perfil: String(perfil).trim(),
-        valor_mensual: safeNumber(String(valor).replace(/[^\d.-]/g, ""), 0),
-        seniority: String(seniority).trim()
-      };
-    }).filter(p => p.perfil);
-
-    res.json({ ok: true, loaded: DB.professionals.length });
-  } catch (e) {
-    res.status(500).json({ error: "No se pudo cargar Excel", detail: String(e) });
-  }
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", time: nowISO(), openaiConfigured });
 });
 
-app.get("/professionals/search", (req, res) => {
-  const q = String(req.query.q || "").toLowerCase().trim();
-  if (!q) return res.json({ items: [] });
+// -------------------- Catalogs: Materials --------------------
+app.post("/materials/load", (req, res) => {
+  const items = req.body?.items;
+  if (!Array.isArray(items)) {
+    return res.status(400).json({ error: "items debe ser un array" });
+  }
+  if (items.length > MAX_CATALOG_ITEMS) {
+    return res.status(400).json({ error: `Demasiados items. Máximo ${MAX_CATALOG_ITEMS}.` });
+  }
 
-  const items = DB.professionals
-    .filter(p => (p.perfil || "").toLowerCase().includes(q))
-    .slice(0, 20);
+  MATERIALS = items.map((x, idx) => ({
+    id: x.id || uid("mat"),
+    name: (x.name || "").toString(),
+    unit: (x.unit || "").toString(),
+    unitPrice: Number(x.unitPrice ?? x.price ?? 0) || 0,
+    source: (x.source || "").toString(),
+    tags: Array.isArray(x.tags) ? x.tags.map(String) : []
+  }));
+
+  res.json({ status: "ok", count: MATERIALS.length });
+});
+
+app.get("/materials/search", (req, res) => {
+  const q = (req.query.q || "").toString();
+  const top = clampNumber(req.query.top ?? 8, 1, 50, 8);
+
+  const nq = normalizeStr(q);
+  if (!nq) return res.json({ items: [] });
+
+  const items = MATERIALS
+    .map((m) => {
+      const hay = normalizeStr(`${m.name} ${m.unit} ${m.source} ${(m.tags || []).join(" ")}`);
+      let score = 0;
+      if (hay.includes(nq)) score += 5;
+      // scoring por tokens
+      nq.split(/\s+/).filter(Boolean).forEach(t => {
+        if (t.length >= 3 && hay.includes(t)) score += 1;
+      });
+      return { ...m, _score: score };
+    })
+    .filter(x => x._score > 0)
+    .sort((a, b) => b._score - a._score)
+    .slice(0, top)
+    .map(({ _score, ...rest }) => rest);
 
   res.json({ items });
 });
 
-// ====== Guardar/editar costeo (MVP memoria) ======
+// -------------------- Catalogs: Professionals --------------------
+app.post("/professionals/load", (req, res) => {
+  const items = req.body?.items;
+  if (!Array.isArray(items)) {
+    return res.status(400).json({ error: "items debe ser un array" });
+  }
+  if (items.length > MAX_CATALOG_ITEMS) {
+    return res.status(400).json({ error: `Demasiados items. Máximo ${MAX_CATALOG_ITEMS}.` });
+  }
+
+  PROFESSIONALS = items.map((x) => ({
+    id: x.id || uid("pro"),
+    role: (x.role || x.name || "").toString(),
+    profile: (x.profile || "").toString(),
+    monthlyRef: Number(x.monthlyRef ?? x.monthly ?? x.value ?? 0) || 0,
+    unit: (x.unit || "mes").toString(),
+    source: (x.source || "").toString(),
+    tags: Array.isArray(x.tags) ? x.tags.map(String) : []
+  }));
+
+  res.json({ status: "ok", count: PROFESSIONALS.length });
+});
+
+app.get("/professionals/search", (req, res) => {
+  const q = (req.query.q || "").toString();
+  const top = clampNumber(req.query.top ?? 8, 1, 50, 8);
+
+  const nq = normalizeStr(q);
+  if (!nq) return res.json({ items: [] });
+
+  const items = PROFESSIONALS
+    .map((p) => {
+      const hay = normalizeStr(`${p.role} ${p.profile} ${p.source} ${(p.tags || []).join(" ")}`);
+      let score = 0;
+      if (hay.includes(nq)) score += 5;
+      nq.split(/\s+/).filter(Boolean).forEach(t => {
+        if (t.length >= 3 && hay.includes(t)) score += 1;
+      });
+      return { ...p, _score: score };
+    })
+    .filter(x => x._score > 0)
+    .sort((a, b) => b._score - a._score)
+    .slice(0, top)
+    .map(({ _score, ...rest }) => rest);
+
+  res.json({ items });
+});
+
+// -------------------- Costings CRUD --------------------
 app.post("/costings/save", (req, res) => {
   const payload = req.body || {};
-  const id = String(Date.now());
-  DB.costings.push({ id, createdAt: nowISO(), updatedAt: nowISO(), payload });
-  res.json({ ok: true, id });
+  const id = uid("cost");
+  const createdAt = nowISO();
+
+  const record = {
+    id,
+    createdAt,
+    updatedAt: createdAt,
+    title: (payload.title || "Costo de producción").toString(),
+    objectText: (payload.objectText || "").toString(),
+    params: payload.params || {},
+    professionals: Array.isArray(payload.professionals) ? payload.professionals : [],
+    materials: Array.isArray(payload.materials) ? payload.materials : [],
+    totals: payload.totals || computeTotals(payload),
+    notes: payload.notes || {},
+    trace: payload.trace || {}
+  };
+
+  COSTINGS.unshift(record);
+  res.json({ status: "ok", id });
 });
 
 app.get("/costings/list", (req, res) => {
-  res.json({
-    items: DB.costings.map(c => ({
-      id: c.id,
-      createdAt: c.createdAt,
-      updatedAt: c.updatedAt,
-      objeto: c.payload?.objeto || ""
-    })).slice(-50).reverse()
-  });
+  const items = COSTINGS.map(c => ({
+    id: c.id,
+    title: c.title,
+    createdAt: c.createdAt,
+    updatedAt: c.updatedAt,
+    totalProduccion: c.totals?.totalProduccion ?? 0,
+    ofertaSugerida: c.totals?.ofertaSugerida ?? null
+  }));
+  res.json({ items });
 });
 
 app.get("/costings/:id", (req, res) => {
-  const c = DB.costings.find(x => x.id === req.params.id);
-  if (!c) return res.status(404).json({ error: "No encontrado" });
-  res.json({ ok: true, item: c });
+  const id = req.params.id;
+  const found = COSTINGS.find(c => c.id === id);
+  if (!found) return res.status(404).json({ error: "No existe ese costeo" });
+  res.json({ item: found });
 });
 
 app.put("/costings/:id", (req, res) => {
-  const c = DB.costings.find(x => x.id === req.params.id);
-  if (!c) return res.status(404).json({ error: "No encontrado" });
-  c.payload = req.body || {};
-  c.updatedAt = nowISO();
-  res.json({ ok: true });
+  const id = req.params.id;
+  const idx = COSTINGS.findIndex(c => c.id === id);
+  if (idx === -1) return res.status(404).json({ error: "No existe ese costeo" });
+
+  const payload = req.body || {};
+  const updatedAt = nowISO();
+
+  const merged = {
+    ...COSTINGS[idx],
+    ...payload,
+    updatedAt,
+  };
+
+  // recalcular totales si vienen tablas o params
+  const needRecalc =
+    payload.params != null ||
+    payload.professionals != null ||
+    payload.materials != null;
+
+  if (needRecalc) {
+    merged.totals = computeTotals({
+      professionals: Array.isArray(merged.professionals) ? merged.professionals : [],
+      materials: Array.isArray(merged.materials) ? merged.materials : [],
+      params: merged.params || {}
+    });
+  }
+
+  COSTINGS[idx] = merged;
+  res.json({ status: "ok" });
 });
 
 app.delete("/costings/:id", (req, res) => {
-  const idx = DB.costings.findIndex(x => x.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: "No encontrado" });
-  DB.costings.splice(idx, 1);
-  res.json({ ok: true });
+  const id = req.params.id;
+  const before = COSTINGS.length;
+  COSTINGS = COSTINGS.filter(c => c.id !== id);
+  if (COSTINGS.length === before) return res.status(404).json({ error: "No existe ese costeo" });
+  res.json({ status: "ok" });
 });
 
-// ====== IA Costeo (PDFs + texto) ======
-app.post(
-  "/ai/costeo",
-  upload.fields([
-    { name: "metodologia_pdf", maxCount: 1 },
-    { name: "tdr_pdf", maxCount: 1 }
-  ]),
-  async (req, res) => {
-    try {
-      if (!client) return res.status(500).json({ error: "OPENAI_API_KEY no configurada en el servidor" });
-
-      const objeto = String(req.body.objeto || "").trim();
-      const notas = String(req.body.notas || "").trim();
-
-      const factorPrestacional = safeNumber(req.body.factorPrestacional, 1.58);
-      const imprevistosPct = safeNumber(req.body.imprevistosPct, 5);
-      const margenPct = safeNumber(req.body.margenPct, 30);
-      const presupuestoFijo = safeNumber(req.body.presupuestoFijo || 0, 0);
-
-      const metodologiaText = String(req.body.metodologiaText || "");
-      const tdrText = String(req.body.tdrText || "");
-
-      if (rejectBase64PDF(metodologiaText) || rejectBase64PDF(tdrText)) {
-        return res.status(400).json({
-          error: "Estás pegando un PDF en base64. NO lo pegues. Súbelo como archivo usando el botón."
-        });
-      }
-
-      let metaPDFText = "";
-      let tdrPDFText = "";
-
-      const metodologiaFile = req.files?.metodologia_pdf?.[0];
-      const tdrFile = req.files?.tdr_pdf?.[0];
-
-      if (metodologiaFile) {
-        const parsed = await pdfParse(metodologiaFile.buffer);
-        metaPDFText = (parsed.text || "").trim();
-      }
-      if (tdrFile) {
-        const parsed = await pdfParse(tdrFile.buffer);
-        tdrPDFText = (parsed.text || "").trim();
-      }
-
-      // Fuente final para IA: texto pegado + texto extraído del PDF
-      const fullTextRaw = [
-        "OBJETO:\n" + objeto,
-        "NOTAS:\n" + notas,
-        "METODOLOGÍA (texto):\n" + metodologiaText,
-        "TDR (texto):\n" + tdrText,
-        "METODOLOGÍA (PDF extraído):\n" + metaPDFText,
-        "TDR (PDF extraído):\n" + tdrPDFText
-      ].join("\n\n");
-
-      // Recorte defensivo
-      const fullText = fullTextRaw.replace(/\s+/g, " ").trim();
-
-      // Si es gigante, hacemos resumen por chunks para evitar request too large
-      const chunks = chunkText(fullText, 9000);
-      let condensed = "";
-
-      if (chunks.length > 1) {
-        const partials = [];
-        for (let i = 0; i < chunks.length; i++) {
-          const r = await client.chat.completions.create({
-            model: MODEL,
-            messages: [
-              {
-                role: "system",
-                content:
-                  "Resume en español, en máximo 12 viñetas, solo requisitos operativos: actividades, entregables, perfiles requeridos y materiales/equipos."
-              },
-              { role: "user", content: chunks[i] }
-            ],
-            temperature: 0.2
-          });
-          partials.push(r.choices?.[0]?.message?.content || "");
-        }
-
-        const r2 = await client.chat.completions.create({
-          model: MODEL,
-          messages: [
-            {
-              role: "system",
-              content:
-                "Fusiona estos resúmenes en uno solo, sin repetir, manteniendo requisitos y necesidades de personal/materiales."
-            },
-            { role: "user", content: partials.join("\n\n---\n\n") }
-          ],
-          temperature: 0.2
-        });
-        condensed = r2.choices?.[0]?.message?.content || "";
-      } else {
-        condensed = fullText;
-      }
-
-      // Pedimos a IA: profesionales + materiales con costos unitarios estimados y parámetros
-      const schema = {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          assumptions: { type: "array", items: { type: "string" } },
-          professionals: {
-            type: "array",
-            items: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                cargo: { type: "string" },
-                cantidad: { type: "number" },
-                meses: { type: "number" },
-                dedicacion: { type: "number" }, // 0..1
-                valor_mensual: { type: "number" },
-                fuente_valor: { type: "string" }
-              },
-              required: ["cargo", "cantidad", "meses", "dedicacion", "valor_mensual", "fuente_valor"]
-            }
+// -------------------- IA: costeo --------------------
+const COST_SCHEMA = {
+  name: "cost_plan",
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      assumptions: { type: "array", items: { type: "string" } },
+      professionals: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            role: { type: "string" },
+            profile: { type: "string" },
+            quantity: { type: "number" },
+            dedication: { type: "number" },   // 1.0 = 100%
+            months: { type: "number" },
+            monthlyValue: { type: "number" },
+            justification: { type: "string" }
           },
-          materials: {
-            type: "array",
-            items: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                item: { type: "string" },
-                cantidad: { type: "number" },
-                meses: { type: "number" },
-                valor_unitario: { type: "number" },
-                tipo: { type: "string" }
-              },
-              required: ["item", "cantidad", "meses", "valor_unitario", "tipo"]
-            }
-          }
-        },
-        required: ["assumptions", "professionals", "materials"]
-      };
+          required: ["role", "quantity", "dedication", "months", "monthlyValue"]
+        }
+      },
+      materials: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            name: { type: "string" },
+            unit: { type: "string" },
+            quantity: { type: "number" },
+            unitPrice: { type: "number" },
+            justification: { type: "string" }
+          },
+          required: ["name", "quantity", "unitPrice"]
+        }
+      }
+    },
+    required: ["professionals", "materials", "assumptions"]
+  }
+};
 
-      // Si tenemos BD de profesionales, le pasamos una muestra para estimar valores
-      const samplePros = DB.professionals.slice(0, 50);
+app.post("/ai/costeo", async (req, res) => {
+  try {
+    if (!openaiConfigured || !client) {
+      return res.status(503).json({
+        error: "OpenAI no está configurado en el backend (falta OPENAI_API_KEY)."
+      });
+    }
 
-      const prompt = `
-Necesito que armes un costeo preliminar para una propuesta.
+    const {
+      objectText = "",
+      metodologiaText = "",
+      tdrText = "",
+      notes = "",
+      params = {},
+      // opcional: permitir que el frontend mande catálogos “en caliente”
+      catalogs = null
+    } = req.body || {};
+
+    // Detectar base64 gigante (PDFs) y cortar por lo sano
+    const combined = `${objectText}\n\n${metodologiaText}\n\n${tdrText}\n\n${notes}`;
+    if (combined.length > MAX_IA_INPUT_CHARS) {
+      return res.status(413).json({
+        error: "El texto enviado es demasiado grande para IA.",
+        detail:
+          "No envíes PDFs como base64. Convierte a texto y pega el contenido (o reduce el documento).",
+        receivedChars: combined.length,
+        maxChars: MAX_IA_INPUT_CHARS
+      });
+    }
+
+    // Catálogos disponibles
+    const mats = catalogs?.materials && Array.isArray(catalogs.materials)
+      ? catalogs.materials.slice(0, MAX_CATALOG_ITEMS)
+      : MATERIALS;
+
+    const pros = catalogs?.professionals && Array.isArray(catalogs.professionals)
+      ? catalogs.professionals.slice(0, MAX_CATALOG_ITEMS)
+      : PROFESSIONALS;
+
+    // Para que la IA “ponga precios”, le damos referencias (top N para no inflar)
+    // Consejo: si tus catálogos son enormes, lo correcto es hacer matching en backend,
+    // pero por ahora lo dejamos simple.
+    const matsCompact = mats.slice(0, 400).map(m => ({
+      name: m.name,
+      unit: m.unit,
+      unitPrice: m.unitPrice
+    }));
+
+    const prosCompact = pros.slice(0, 300).map(p => ({
+      role: p.role,
+      monthlyRef: p.monthlyRef
+    }));
+
+    const factorPrestacional = clampNumber(params.factorPrestacional ?? 1.58, 1.0, 3.0, 1.58);
+    const imprevistosPct = clampNumber(params.imprevistosPct ?? 5, 0, 40, 5);
+    const margenPct = clampNumber(params.margenPct ?? 30, 0, 80, 30);
+
+    const prompt = `
+Eres un analista senior de costos en consultoría ambiental en Colombia.
+Tu tarea: proponer una tabla de PROFESIONALES y MATERIALES a partir del OBJETO, METODOLOGÍA, TDR y NOTAS.
+Debes incluir cantidades, dedicación (1.0=100%), meses y valor mensual para profesionales.
+Para materiales: cantidades y valor unitario.
+REGLA CLAVE: usa los valores unitarios/mensuales de los catálogos como referencia. Si no existe exacto, usa el más cercano y explica.
+Devuelve SOLO JSON válido según el schema, sin texto adicional.
+
 Parámetros financieros:
-- factor_prestacional = ${factorPrestacional}
-- imprevistos_pct = ${imprevistosPct}
-- margen_pct = ${margenPct}
-- presupuesto_fijo = ${presupuestoFijo}
+- Factor prestacional: ${factorPrestacional} (se aplica a costo de profesionales)
+- Imprevistos %: ${imprevistosPct}
+- Margen %: ${margenPct}
 
-Reglas:
-1) Profesionales: define cargo, cantidad, meses, dedicación (0 a 1), valor_mensual.
-2) Valor mensual: si encuentras match aproximado en la BD (muestra), úsalo. Si no, estima según notas y complejidad y pon fuente_valor="estimado".
-3) Materiales: lista items (software/hardware/papelería/desplazamientos/viáticos/etc.) con cantidad, meses, valor_unitario estimado y tipo.
-4) Devuelve SOLO JSON válido, sin texto adicional.
+CATÁLOGO PROFESIONALES (referencia):
+${JSON.stringify(prosCompact)}
 
-Contexto resumido:
-${condensed}
+CATÁLOGO MATERIALES (referencia):
+${JSON.stringify(matsCompact)}
 
-Muestra BD de profesionales (para aproximar valores mensuales):
-${JSON.stringify(samplePros)}
+OBJETO DEL CONTRATO:
+${objectText}
+
+METODOLOGÍA:
+${metodologiaText}
+
+TDR / ALCANCE:
+${tdrText}
+
+NOTAS (duración, ciudad, restricciones, perfiles obligatorios, etc):
+${notes}
 `.trim();
 
-      const resp = await client.chat.completions.create({
-        model: MODEL,
-        messages: [
-          { role: "system", content: "Eres un analista de costos. Respondes SOLO JSON." },
-          { role: "user", content: prompt }
-        ],
-        temperature: 0.2,
-        response_format: { type: "json_schema", json_schema: { name: "cost_plan", schema } }
-      });
-
-      const content = resp.choices?.[0]?.message?.content || "{}";
-      const json = JSON.parse(content);
-
-      res.json({
-        ok: true,
-        input: { objeto, factorPrestacional, imprevistosPct, margenPct, presupuestoFijo },
-        plan: json
-      });
-    } catch (e) {
-      const msg = String(e?.message || e);
-      // Si OpenAI devuelve error de tamaño/cuota, lo devolvemos con claridad
-      if (msg.includes("429") || msg.toLowerCase().includes("rate") || msg.toLowerCase().includes("quota")) {
-        return res.status(429).json({
-          error: "Límite/cuota o tamaño excedido en OpenAI",
-          detail: msg
-        });
+    // Responses API (recomendada para proyectos nuevos)
+    const resp = await client.responses.create({
+      model: "gpt-4o-mini",
+      input: prompt,
+      text: {
+        format: {
+          type: "json_schema",
+          json_schema: COST_SCHEMA
+        }
       }
-      res.status(500).json({ error: "Error en IA", detail: msg });
-    }
-  }
-);
+    });
 
+    // Extraer JSON
+    const outputText = resp.output_text || "";
+    let plan;
+    try {
+      plan = JSON.parse(outputText);
+    } catch (e) {
+      return res.status(502).json({
+        error: "La IA devolvió una respuesta que no es JSON válido.",
+        detail: outputText.slice(0, 2000)
+      });
+    }
+
+    // Normalizar números y calcular totales
+    const professionals = (plan.professionals || []).map(p => ({
+      role: (p.role || "").toString(),
+      profile: (p.profile || "").toString(),
+      quantity: clampNumber(p.quantity ?? 0, 0, 1e9, 0),
+      dedication: clampNumber(p.dedication ?? 1, 0, 2, 1),
+      months: clampNumber(p.months ?? 0, 0, 1e9, 0),
+      monthlyValue: clampNumber(p.monthlyValue ?? 0, 0, 1e12, 0),
+      justification: (p.justification || "").toString()
+    }));
+
+    const materials = (plan.materials || []).map(m => ({
+      name: (m.name || "").toString(),
+      unit: (m.unit || "").toString(),
+      quantity: clampNumber(m.quantity ?? 0, 0, 1e12, 0),
+      unitPrice: clampNumber(m.unitPrice ?? 0, 0, 1e12, 0),
+      justification: (m.justification || "").toString()
+    }));
+
+    const totals = computeTotals({
+      professionals,
+      materials,
+      params: { ...params, factorPrestacional, imprevistosPct, margenPct }
+    });
+
+    res.json({
+      status: "ok",
+      plan: {
+        assumptions: Array.isArray(plan.assumptions) ? plan.assumptions.map(String) : [],
+        professionals,
+        materials
+      },
+      totals
+    });
+  } catch (err) {
+    // Manejo de errores OpenAI típicos (429, 401, etc.)
+    const status = err?.status || err?.response?.status || 500;
+    const msg = err?.message || "Error desconocido";
+    const detail = err?.response?.data || null;
+
+    // 429 (rate limit / quota)
+    if (status === 429) {
+      return res.status(429).json({
+        error: "Límite alcanzado (429).",
+        detail:
+          "Esto suele ser por cuota del proyecto/organización o rate limit. Intenta de nuevo en 30–60s, y revisa límites en OpenAI.",
+        raw: msg
+      });
+    }
+
+    // 401 (api key)
+    if (status === 401) {
+      return res.status(401).json({
+        error: "No autorizado (401). Revisa OPENAI_API_KEY en Render.",
+        raw: msg
+      });
+    }
+
+    res.status(500).json({
+      error: "Error en IA",
+      detail: typeof detail === "string" ? detail : msg
+    });
+  }
+});
+
+// -------------------- Start --------------------
 app.listen(PORT, () => {
-  console.log("Servidor escuchando en puerto:", PORT);
+  console.log(`Servidor escuchando en puerto: ${PORT}`);
+  console.log(`OpenAI configurado: ${openaiConfigured ? "SI" : "NO"}`);
 });
