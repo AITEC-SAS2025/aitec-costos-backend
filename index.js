@@ -267,14 +267,15 @@ ${notes}
 `.trim();
 
     const resp = await client.responses.create({
-      model: "gpt-4o-mini",
-      input: prompt,
-      text: {
-        format: {
-          type: "json_schema",
-          json_schema: COST_SCHEMA
-        }
-      }
+  model: "gpt-4o-mini",
+  input: prompt,
+  text: {
+    format: {
+      type: "json_schema",
+      name: COST_SCHEMA.name,
+      schema: COST_SCHEMA.schema
+    }
+  }
     });
 
     const outputText = resp.output_text || "";
