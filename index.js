@@ -189,7 +189,7 @@ const COST_SCHEMA = {
             monthlyValue: { type: "number" },
             justification: { type: "string" }
           },
-          required: ["role", "quantity", "dedication", "months", "monthlyValue"]
+          required: ["role", "profile", "quantity", "dedication", "months", "monthlyValue", "justification"]
         }
       },
       materials: {
@@ -204,7 +204,7 @@ const COST_SCHEMA = {
             unitPrice: { type: "number" },
             justification: { type: "string" }
           },
-          required: ["name", "quantity", "unitPrice"]
+          required: ["name", "unit", "quantity", "unitPrice", "justification"]
         }
       }
     },
